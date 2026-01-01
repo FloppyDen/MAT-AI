@@ -7,6 +7,8 @@ from torch.nn.utils.rnn import pad_sequence
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
+import os
+
 import pandas as pd
 import random
 from razdel import tokenize
@@ -126,74 +128,112 @@ val_dataset = ToxicDataset(val_texts, val_labels, vocab)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
 val_loader = DataLoader(val_dataset, batch_size=32, collate_fn=collate_fn)
 
-# ==================== 5. Модель ====================
+# ==================== Улучшенная модель и оптимизатор ====================
+MODEL_PATH = "best_mat_detector.pth"  # Файл для сохранения лучшей модели
+
 class TextClassifier(nn.Module):
-    def __init__(self, vocab_size, embed_dim=128, hidden_dim=256, num_classes=3, dropout=0.3):
+    def __init__(self, vocab_size, embed_dim=256, hidden_dim=256, num_classes=3, dropout=0.5):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True, num_layers=1)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=2,  # 2 слоя вместо 1
+                            batch_first=True, bidirectional=True, dropout=0.5)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # Нормализация для стабильности
 
     def forward(self, x, lengths):
         embed = self.embedding(x)
         packed = torch.nn.utils.rnn.pack_padded_sequence(embed, lengths.cpu(), batch_first=True, enforce_sorted=False)
         _, (hidden, _) = self.lstm(packed)
-        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)  # bidirectional
+        hidden = self.layer_norm(hidden)
         out = self.dropout(hidden)
         out = self.fc(out)
         return out
 
-# Перенос модели на GPU
-model = TextClassifier(len(vocab), embed_dim=128, hidden_dim=256, num_classes=3).to(device)
+# Создание модели
+model = TextClassifier(len(vocab), embed_dim=256, hidden_dim=256, num_classes=3).to(device)
 
+# Улучшенный оптимизатор с weight decay и scheduler
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)  # AdamW лучше Adam
 
-print(f"\nМодель перенесена на: {next(model.parameters()).device}")
+# Scheduler для снижения lr при застое
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2,)
 
-# ==================== 6. Обучение ====================
+best_val_acc = 0.0
+
 def train_epoch():
     model.train()
     total_loss = 0
     for texts, labels, lengths in train_loader:
-        texts = texts.to(device)      # ← GPU
-        labels = labels.to(device)    # ← GPU
-        lengths = lengths.to(device)  # ← можно оставить на CPU, но для единообразия
+        texts = texts.to(device)
+        labels = labels.to(device)
 
         optimizer.zero_grad()
         outputs = model(texts, lengths)
         loss = criterion(outputs, labels)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Защита от взрыва градиентов
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(train_loader)
 
 def evaluate():
     model.eval()
-    total_loss = 0
     correct = 0
     total = 0
     with torch.no_grad():
         for texts, labels, lengths in val_loader:
             texts = texts.to(device)
             labels = labels.to(device)
-
             outputs = model(texts, lengths)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
             pred = outputs.argmax(dim=1)
             correct += (pred == labels).sum().item()
             total += labels.size(0)
-    return total_loss / len(val_loader), correct / total
+    return correct / total
+# ==================== Загрузка модели, если она уже обучена ====================
+if os.path.exists(MODEL_PATH):
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    print(f"Загружена сохранённая модель из {MODEL_PATH}")
+    print("Обучение пропущено — используем готовую модель.\n")
 
+    # Быстрая проверка accuracy на валидации
+    quick_acc = evaluate()
+    print(f"Текущая точность загруженной модели: {quick_acc:.4f}\n")
+else:
+    print("Сохранённой модели не найдено — начинаем обучение с нуля.\n")
 # Запуск обучения
-epochs = 8
+epochs = 20  # Можно больше — early stopping остановит раньше
+patience = 5  # Сколько эпох ждать улучшения
+no_improve = 0
+
 print("\nНачало обучения...\n")
+
 for epoch in range(epochs):
     train_loss = train_epoch()
-    val_loss, val_acc = evaluate()
-    print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+    val_acc = evaluate()
+
+    print(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Accuracy: {val_acc:.4f}")
+
+    # Сохранение лучшей модели
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), MODEL_PATH)
+        print(f"  >>> Новая лучшая модель сохранена! Accuracy: {val_acc:.4f}")
+        no_improve = 0
+    else:
+        no_improve += 1
+
+    scheduler.step(val_acc)  # Уменьшаем lr при отсутствии улучшения
+
+    # Early stopping
+    if no_improve >= patience:
+        print(f"\nEarly stopping на эпохе {epoch+1}. Лучшая accuracy: {best_val_acc:.4f}")
+        break
+
+print(f"\nОбучение завершено. Лучшая accuracy: {best_val_acc:.4f}")
 
 # ==================== 7. Тестирование ====================
 model.eval()
